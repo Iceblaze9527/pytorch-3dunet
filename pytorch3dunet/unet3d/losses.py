@@ -6,7 +6,7 @@ from torch.nn import MSELoss, SmoothL1Loss, L1Loss
 
 from pytorch3dunet.embeddings.contrastive_loss import ContrastiveLoss
 from pytorch3dunet.unet3d.utils import expand_as_one_hot
-
+from pytorch3dunet.unet3d.utils import one_hot
 
 def compute_per_channel_dice(input, target, epsilon=1e-6, weight=None):
     """
@@ -234,7 +234,203 @@ class PixelWiseCrossEntropyLoss(nn.Module):
         # average the losses
         return result.mean()
 
+class FocalLoss(nn.Module):
+    """Criterion that computes Focal loss.
 
+    According to [1], the Focal loss is computed as follows:
+
+    .. math::
+
+        \text{FL}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \, \text{log}(p_t)
+
+    where:
+       - :math:`p_t` is the model's estimated probability for each class.
+
+    Arguments:
+        alpha (float): Weighting factor :math:`\alpha \in [0, 1]`.
+        gamma (float): Focusing parameter :math:`\gamma >= 0`.
+        reduction (str, optional): Specifies the reduction to apply to the
+         output: ‘none’ | ‘mean’ | ‘sum’. ‘none’: no reduction will be applied,
+         ‘mean’: the sum of the output will be divided by the number of elements
+         in the output, ‘sum’: the output will be summed. Default: ‘none’.
+
+    Shape:
+        - Input: :math:`(N, C, *)` where C = number of classes.
+        - Target: :math:`(N, *)` where each value is
+          :math:`0 ≤ targets[i] ≤ C−1`.
+
+    References:
+        [1] https://arxiv.org/abs/1708.02002
+    """
+
+    def __init__(self, alpha = 0.75, gamma = 2.0, eps = 1e-8):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+
+    def focal_loss(input, target, alpha = 0.75, gamma = 2.0, reduction = 'none', eps = 1e-8):
+        if not torch.is_tensor(input):
+            raise TypeError("Input type is not a torch.Tensor. Got {}".format(type(input)))
+
+        if not len(input.shape) >= 2:
+            raise ValueError("Invalid input shape, we expect BxCx*. Got: {}".format(input.shape))
+
+        if input.size(0) != target.size(0):
+            raise ValueError('Expected input batch_size ({}) to match target batch_size ({}).'.format(input.size(0), target.size(0)))
+
+        n = input.size(0)
+        out_size = (n,) + input.size()[2:]
+        
+        if target.size()[1:] != input.size()[2:]:
+            raise ValueError('Expected target size {}, got {}'.format(out_size, target.size()))
+
+        if not input.device == target.device:
+            raise ValueError("input and target must be in the same device. Got: {} and {}".format(input.device, target.device))
+
+        # compute softmax over the classes axis
+        input_s = (F.sigmoid(input) + eps).view(-1)
+        target_t = (target.view(-1)).type_as(input_s)
+        
+        assert input_s.size() == target_t.size()
+        
+        p_t = target_t * input_s + (1 - target_t) * (1 - input_s)
+        alpha_t = target_t * alpha + (1 - target_t) * (1 - alpha)
+
+        loss = - alpha_t * torch.pow(-p_t + 1., gamma) * torch.log(input_s)
+        
+        return torch.mean(loss)
+    
+    def forward(self, input, target):
+        return self.focal_loss(input, target, alpha=self.alpha, gamma=self.gamma, eps=self.eps)
+    
+class TverskyLoss(nn.Module):
+    """Criterion that computes Tversky Coeficient loss.
+
+    According to [1], we compute the Tversky Coefficient as follows:
+
+    .. math::
+
+        \text{S}(P, G, \alpha; \beta) =
+          \frac{|PG|}{|PG| + \alpha |P \setminus G| + \beta |G \setminus P|}
+
+    where:
+       - :math:`P` and :math:`G` are the predicted and ground truth binary
+         labels.
+       - :math:`\alpha` and :math:`\beta` control the magnitude of the
+         penalties for FPs and FNs, respectively.
+
+    Notes:
+       - :math:`\alpha = \beta = 0.5` => dice coeff
+       - :math:`\alpha = \beta = 1` => tanimoto coeff
+       - :math:`\alpha + \beta = 1` => F beta coeff
+
+    Shape:
+        - Input: :math:`(N, C, D, H, W)` where C = number of classes.
+        - Target: :math:`(N, D, H, W)` where each value is
+          :math:`0 ≤ targets[i] ≤ C−1`.
+
+    References:
+        [1]: https://arxiv.org/abs/1706.05721
+    """
+
+    def __init__(self, alpha = 0.1, beta = 0.9, eps = 1e-8):
+        super(TverskyLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+
+    def tversky_loss(input, target, alpha = 0.1, beta = 0.9, eps = 1e-8):
+        if not torch.is_tensor(input):
+            raise TypeError("Input type is not a torch.Tensor. Got {}".format(type(input)))
+
+        if not len(input.shape) == 5:
+            raise ValueError("Invalid input shape, we expect NxCxDxHxW. Got: {}".format(input.shape))
+
+        if not input.shape[-3:] == target.shape[-3:]:
+            raise ValueError("input and target shapes must be the same. Got: {} and {}".format(input.shape, input.shape))
+
+        if not input.device == target.device:
+            raise ValueError("input and target must be in the same device. Got: {} and {}".format(input.device, target.device))
+
+        # compute softmax over the classes axis
+        input_soft = F.softmax(input, dim=1)
+
+        # create the labels one hot tensor
+        target_one_hot = one_hot(target, num_classes=input.shape[1], device=input.device, dtype=input.dtype)
+
+        # compute the actual dice score
+        dims = (1, 2, 3, 4)
+        intersection = torch.sum(input_soft * target_one_hot, dims)
+        fps = torch.sum(input_soft * (-target_one_hot + 1.), dims)
+        fns = torch.sum((-input_soft + 1.) * target_one_hot, dims)
+
+        numerator = intersection
+        denominator = intersection + alpha * fps + beta * fns
+        tversky_loss = numerator / (denominator + eps)
+        
+        return torch.mean(-tversky_loss + 1.)
+    
+    def forward(self, input, target):
+        return self.tversky_loss(input, target, alpha=self.alpha, beta=self.beta, eps=self.eps)
+    
+class LovaszSoftmax(nn.Module):
+    def __init__(self, reduction='mean'):
+        super(LovaszSoftmax, self).__init__()
+        self.reduction = reduction
+
+    def prob_flatten(self, input, target):
+        assert input.dim() in [4, 5]
+        num_class = input.size(1)
+        if input.dim() == 4:
+            input = input.permute(0, 2, 3, 1).contiguous()
+            input_flatten = input.view(-1, num_class)
+        elif input.dim() == 5:
+            input = input.permute(0, 2, 3, 4, 1).contiguous()
+            input_flatten = input.view(-1, num_class)
+        target_flatten = target.view(-1)
+        return input_flatten, target_flatten
+
+    def lovasz_grad(gt_sorted):
+        p = len(gt_sorted)
+        gts = gt_sorted.sum()
+        intersection = gts - gt_sorted.float().cumsum(0)
+        union = gts + (1 - gt_sorted).float().cumsum(0)
+        jaccard = 1. - intersection / union
+        if p > 1: # cover 1-pixel case
+            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+        return jaccard
+    
+    def lovasz_softmax_flat(self, inputs, targets):
+        num_classes = inputs.size(1)
+        losses = []
+        
+        for c in range(num_classes):
+            target_c = (targets == c).float()
+            if num_classes == 1:
+                input_c = inputs[:, 0]
+            else:
+                input_c = inputs[:, c]
+            loss_c = (Variable(target_c) - input_c).abs()
+            loss_c_sorted, loss_index = torch.sort(loss_c, 0, descending=True)
+            target_c_sorted = target_c[loss_index]
+            losses.append(torch.dot(loss_c_sorted, Variable(self.lovasz_grad(target_c_sorted))))
+        
+        losses = torch.stack(losses)
+
+        if self.reduction == 'none':
+            loss = losses
+        elif self.reduction == 'sum':
+            loss = losses.sum()
+        else:
+            loss = losses.mean()
+        return loss
+
+    def forward(self, inputs, targets):
+        inputs, targets = self.prob_flatten(inputs, targets)
+        losses = self.lovasz_softmax_flat(inputs, targets)
+        return losses
+    
 class TagsAngularLoss(nn.Module):
     def __init__(self, tags_coefficients):
         super(TagsAngularLoss, self).__init__()
@@ -350,45 +546,72 @@ def get_loss_criterion(config):
 
 
 SUPPORTED_LOSSES = ['BCEWithLogitsLoss', 'BCEDiceLoss', 'CrossEntropyLoss', 'WeightedCrossEntropyLoss',
-                    'PixelWiseCrossEntropyLoss', 'GeneralizedDiceLoss', 'DiceLoss', 'TagsAngularLoss', 'MSELoss',
+                    'PixelWiseCrossEntropyLoss', 'GeneralizedDiceLoss', 'DiceLoss', 'FocalLoss', 'TverskyLoss', 'LovaszSoftmax', 'TagsAngularLoss', 'MSELoss',
                     'SmoothL1Loss', 'L1Loss', 'WeightedSmoothL1Loss']
 
 
 def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
     if name == 'BCEWithLogitsLoss':
         return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
     elif name == 'BCEDiceLoss':
-        alpha = loss_config.get('alphs', 1.)
+        alpha = loss_config.get('alpha', 1.)
         beta = loss_config.get('beta', 1.)
         return BCEDiceLoss(alpha, beta)
+    
     elif name == 'CrossEntropyLoss':
         if ignore_index is None:
             ignore_index = -100  # use the default 'ignore_index' as defined in the CrossEntropyLoss
         return nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index)
+    
     elif name == 'WeightedCrossEntropyLoss':
         if ignore_index is None:
             ignore_index = -100  # use the default 'ignore_index' as defined in the CrossEntropyLoss
         return WeightedCrossEntropyLoss(ignore_index=ignore_index)
+    
     elif name == 'PixelWiseCrossEntropyLoss':
         return PixelWiseCrossEntropyLoss(class_weights=weight, ignore_index=ignore_index)
+    
     elif name == 'GeneralizedDiceLoss':
         sigmoid_normalization = loss_config.get('sigmoid_normalization', True)
         return GeneralizedDiceLoss(sigmoid_normalization=sigmoid_normalization)
+    
     elif name == 'DiceLoss':
         sigmoid_normalization = loss_config.get('sigmoid_normalization', True)
         return DiceLoss(weight=weight, sigmoid_normalization=sigmoid_normalization)
+    
+    elif name == 'FocalLoss':
+        alpha = loss_config.get('alpha', 0.75)
+        gamma = loss_config.get('gamma', 2.)
+        eps = loss_config.get('eps', 1e-8)
+        return FocalLoss(alpha=alpha, gamma=gamma, eps=eps)
+    
+    elif name == 'TverskyLoss':
+        alpha = loss_config.get('alpha', 0.1)
+        beta = loss_config.get('beta', 1 - alpha)
+        eps = loss_config.get('eps', 1e-8)
+        return TverskyLoss(alpha=alpha, beta=beta, eps=eps)
+    
+    elif name == 'LovaszSoftmax':
+        return LovaszSoftmax()
+    
     elif name == 'TagsAngularLoss':
         tags_coefficients = loss_config['tags_coefficients']
         return TagsAngularLoss(tags_coefficients)
+    
     elif name == 'MSELoss':
         return MSELoss()
+    
     elif name == 'SmoothL1Loss':
         return SmoothL1Loss()
+    
     elif name == 'L1Loss':
         return L1Loss()
+    
     elif name == 'ContrastiveLoss':
         return ContrastiveLoss(loss_config['delta_var'], loss_config['delta_dist'], loss_config['norm'],
                                loss_config['alpha'], loss_config['beta'], loss_config['gamma'])
+    
     elif name == 'WeightedSmoothL1Loss':
         return WeightedSmoothL1Loss(threshold=loss_config['threshold'], initial_weight=loss_config['initial_weight'],
                                     apply_below_threshold=loss_config.get('apply_below_threshold', True))
