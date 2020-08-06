@@ -6,7 +6,6 @@ from torch.nn import MSELoss, SmoothL1Loss, L1Loss
 
 from pytorch3dunet.embeddings.contrastive_loss import ContrastiveLoss
 from pytorch3dunet.unet3d.utils import expand_as_one_hot
-from pytorch3dunet.unet3d.utils import one_hot
 
 def compute_per_channel_dice(input, target, epsilon=1e-6, weight=None):
     """
@@ -256,7 +255,7 @@ class FocalLoss(nn.Module):
 
     Shape:
         - Input: :math:`(N, C, *)` where C = number of classes.
-        - Target: :math:`(N, *)` where each value is
+        - Target: :math:`(N, C, *)` where each value is
           :math:`0 ≤ targets[i] ≤ C−1`.
 
     References:
@@ -269,7 +268,8 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
         self.eps = eps
 
-    def focal_loss(input, target, alpha = 0.75, gamma = 2.0, reduction = 'none', eps = 1e-8):
+    def focal_loss(self, input, target, alpha = 0.75, gamma = 2.0, reduction = 'none', eps = 1e-8):
+        batch_size = input.size(0)
         if not torch.is_tensor(input):
             raise TypeError("Input type is not a torch.Tensor. Got {}".format(type(input)))
 
@@ -279,23 +279,16 @@ class FocalLoss(nn.Module):
         if input.size(0) != target.size(0):
             raise ValueError('Expected input batch_size ({}) to match target batch_size ({}).'.format(input.size(0), target.size(0)))
 
-        n = input.size(0)
-        out_size = (n,) + input.size()[2:]
-        
-        if target.size()[1:] != input.size()[2:]:
-            raise ValueError('Expected target size {}, got {}'.format(out_size, target.size()))
-
         if not input.device == target.device:
             raise ValueError("input and target must be in the same device. Got: {} and {}".format(input.device, target.device))
 
-        # compute softmax over the classes axis
-        input_s = (F.sigmoid(input) + eps).view(-1)
-        target_t = (target.view(-1)).type_as(input_s)
+        input_s = (torch.sigmoid(input) + eps).view(batch_size, -1)
+        target_t = (target.view(batch_size, -1)).type_as(input_s)
         
         assert input_s.size() == target_t.size()
         
-        p_t = target_t * input_s + (1 - target_t) * (1 - input_s)
-        alpha_t = target_t * alpha + (1 - target_t) * (1 - alpha)
+        p_t = torch.sum(target_t * input_s, 1) + torch.sum((1 - target_t) * (1 - input_s), 1)
+        alpha_t = torch.sum(target_t * alpha, 1) + torch.sum((1 - target_t) * (1 - alpha), 1)
 
         loss = - alpha_t * torch.pow(-p_t + 1., gamma) * torch.log(input_s)
         
@@ -305,93 +298,69 @@ class FocalLoss(nn.Module):
         return self.focal_loss(input, target, alpha=self.alpha, gamma=self.gamma, eps=self.eps)
     
 class TverskyLoss(nn.Module):
-    """Criterion that computes Tversky Coeficient loss.
-
-    According to [1], we compute the Tversky Coefficient as follows:
-
-    .. math::
-
-        \text{S}(P, G, \alpha; \beta) =
-          \frac{|PG|}{|PG| + \alpha |P \setminus G| + \beta |G \setminus P|}
-
-    where:
-       - :math:`P` and :math:`G` are the predicted and ground truth binary
-         labels.
-       - :math:`\alpha` and :math:`\beta` control the magnitude of the
-         penalties for FPs and FNs, respectively.
-
-    Notes:
-       - :math:`\alpha = \beta = 0.5` => dice coeff
-       - :math:`\alpha = \beta = 1` => tanimoto coeff
-       - :math:`\alpha + \beta = 1` => F beta coeff
-
-    Shape:
-        - Input: :math:`(N, C, D, H, W)` where C = number of classes.
-        - Target: :math:`(N, D, H, W)` where each value is
-          :math:`0 ≤ targets[i] ≤ C−1`.
-
-    References:
-        [1]: https://arxiv.org/abs/1706.05721
-    """
-
-    def __init__(self, alpha = 0.1, beta = 0.9, eps = 1e-8):
+    def __init__(self, alpha=0.1, beta=0.9, eps = 1e-8):
+        """Tversky loss of binary class
+        Args:
+            alpha: controls the penalty for false positives.
+            beta: penalty for false negative. Larger beta weigh recall higher
+            ignore_index: Specifies a target value that is ignored and does not contribute to the input gradient'
+        Shapes:
+            output: A tensor of shape [N, 1,(d,) h, w] without sigmoid activation function applied
+            target: A tensor of shape same with output
+        Returns:
+            Loss tensor according to arg reduction
+        Raise:
+            Exception if unexpected reduction
+        """
         super(TverskyLoss, self).__init__()
         self.alpha = alpha
         self.beta = beta
-        self.eps = eps
-
-    def tversky_loss(input, target, alpha = 0.1, beta = 0.9, eps = 1e-8):
-        if not torch.is_tensor(input):
-            raise TypeError("Input type is not a torch.Tensor. Got {}".format(type(input)))
-
-        if not len(input.shape) == 5:
-            raise ValueError("Invalid input shape, we expect NxCxDxHxW. Got: {}".format(input.shape))
-
-        if not input.shape[-3:] == target.shape[-3:]:
-            raise ValueError("input and target shapes must be the same. Got: {} and {}".format(input.shape, input.shape))
-
-        if not input.device == target.device:
-            raise ValueError("input and target must be in the same device. Got: {} and {}".format(input.device, target.device))
-
-        # compute softmax over the classes axis
-        input_soft = F.softmax(input, dim=1)
-
-        # create the labels one hot tensor
-        target_one_hot = one_hot(target, num_classes=input.shape[1], device=input.device, dtype=input.dtype)
-
-        # compute the actual dice score
-        dims = (1, 2, 3, 4)
-        intersection = torch.sum(input_soft * target_one_hot, dims)
-        fps = torch.sum(input_soft * (-target_one_hot + 1.), dims)
-        fns = torch.sum((-input_soft + 1.) * target_one_hot, dims)
-
-        numerator = intersection
-        denominator = intersection + alpha * fps + beta * fns
-        tversky_loss = numerator / (denominator + eps)
+        self.eps = 1e-8
+        self.smooth = 10
         
-        return torch.mean(-tversky_loss + 1.)
-    
+        assert self.alpha + self.beta == 1.
+
     def forward(self, input, target):
-        return self.tversky_loss(input, target, alpha=self.alpha, beta=self.beta, eps=self.eps)
+        batch_size = input.size(0)
+        bg_target = 1 - target
+
+        input_s = (torch.sigmoid(input) + self.eps).view(batch_size, -1)
+        target_t = (target.view(batch_size, -1)).type_as(input_s)
+        bg_target_t = (bg_target.view(batch_size, -1)).type_as(input_s)
+        
+        assert input_s.size() == target_t.size()
+
+        P_G = torch.sum(input_s * target_t, 1)  # TP
+        P_NG = torch.sum(input_s * bg_target_t, 1)  # FP
+        NP_G = torch.sum((1 - input_s) * target_t, 1)  # FN
+
+        tversky_index = P_G / (P_G + self.alpha * P_NG + self.beta * NP_G + self.smooth)
+
+        loss = 1. - tversky_index
+        
+        return torch.mean(loss)
     
 class LovaszSoftmax(nn.Module):
-    def __init__(self, reduction='mean'):
+    def __init__(self):
         super(LovaszSoftmax, self).__init__()
-        self.reduction = reduction
 
     def prob_flatten(self, input, target):
         assert input.dim() in [4, 5]
         num_class = input.size(1)
+        
         if input.dim() == 4:
             input = input.permute(0, 2, 3, 1).contiguous()
             input_flatten = input.view(-1, num_class)
         elif input.dim() == 5:
             input = input.permute(0, 2, 3, 4, 1).contiguous()
             input_flatten = input.view(-1, num_class)
+        
+        input_flatten_proba = torch.sigmoid(input_flatten)
         target_flatten = target.view(-1)
-        return input_flatten, target_flatten
+        
+        return input_flatten_proba, target_flatten
 
-    def lovasz_grad(gt_sorted):
+    def lovasz_grad(self, gt_sorted):
         p = len(gt_sorted)
         gts = gt_sorted.sum()
         intersection = gts - gt_sorted.float().cumsum(0)
@@ -417,14 +386,8 @@ class LovaszSoftmax(nn.Module):
             losses.append(torch.dot(loss_c_sorted, Variable(self.lovasz_grad(target_c_sorted))))
         
         losses = torch.stack(losses)
-
-        if self.reduction == 'none':
-            loss = losses
-        elif self.reduction == 'sum':
-            loss = losses.sum()
-        else:
-            loss = losses.mean()
-        return loss
+        
+        return losses.mean()
 
     def forward(self, inputs, targets):
         inputs, targets = self.prob_flatten(inputs, targets)
