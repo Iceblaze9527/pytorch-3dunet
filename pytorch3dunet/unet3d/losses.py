@@ -234,68 +234,33 @@ class PixelWiseCrossEntropyLoss(nn.Module):
         return result.mean()
 
 class FocalLoss(nn.Module):
-    """Criterion that computes Focal loss.
-
-    According to [1], the Focal loss is computed as follows:
-
-    .. math::
-
-        \text{FL}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \, \text{log}(p_t)
-
-    where:
-       - :math:`p_t` is the model's estimated probability for each class.
-
-    Arguments:
-        alpha (float): Weighting factor :math:`\alpha \in [0, 1]`.
-        gamma (float): Focusing parameter :math:`\gamma >= 0`.
-        reduction (str, optional): Specifies the reduction to apply to the
-         output: ‘none’ | ‘mean’ | ‘sum’. ‘none’: no reduction will be applied,
-         ‘mean’: the sum of the output will be divided by the number of elements
-         in the output, ‘sum’: the output will be summed. Default: ‘none’.
-
-    Shape:
-        - Input: :math:`(N, C, *)` where C = number of classes.
-        - Target: :math:`(N, C, *)` where each value is
-          :math:`0 ≤ targets[i] ≤ C−1`.
-
-    References:
-        [1] https://arxiv.org/abs/1708.02002
-    """
-
-    def __init__(self, alpha = 0.75, gamma = 2.0, eps = 1e-8):
+    def __init__(self, alpha=0.75, gamma=2):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.eps = eps
+        if isinstance(alpha,(float,int)): self.alpha = torch.Tensor([alpha,1-alpha])
+        if isinstance(alpha,list): self.alpha = torch.Tensor(alpha)
 
-    def focal_loss(self, input, target, alpha = 0.75, gamma = 2.0, reduction = 'none', eps = 1e-8):
-        batch_size = input.size(0)
-        if not torch.is_tensor(input):
-            raise TypeError("Input type is not a torch.Tensor. Got {}".format(type(input)))
-
-        if not len(input.shape) >= 2:
-            raise ValueError("Invalid input shape, we expect BxCx*. Got: {}".format(input.shape))
-
-        if input.size(0) != target.size(0):
-            raise ValueError('Expected input batch_size ({}) to match target batch_size ({}).'.format(input.size(0), target.size(0)))
-
-        if not input.device == target.device:
-            raise ValueError("input and target must be in the same device. Got: {} and {}".format(input.device, target.device))
-
-        input_s = (torch.sigmoid(input) + eps).view(batch_size, -1)
-        target_t = (target.view(batch_size, -1)).type_as(input_s)
-        
-        assert input_s.size() == target_t.size()
-        
-        p_t = torch.sum(target_t * input_s, 1) + torch.sum((1 - target_t) * (1 - input_s), 1)
-        alpha_t = torch.sum(target_t * alpha, 1) + torch.sum((1 - target_t) * (1 - alpha), 1)
-
-        loss = - alpha_t * torch.pow(-p_t + 1., gamma) * torch.log(input_s)
-        
-        return torch.mean(loss)
-    
     def forward(self, input, target):
-        return self.focal_loss(input, target, alpha=self.alpha, gamma=self.gamma, eps=self.eps)
+        if input.dim()>2:
+            input = input.contiguous().view(input.size(0),input.size(1),-1)  # N,C,D,H,W => N,C,D*H*W
+            input = input.transpose(1,2)    # N,C,H*W => N,D*H*W,C
+            input = input.contiguous().view(-1,input.size(2))   # N,D*H*W,C => N*D*H*W,C
+        target = target.view(-1,1)
+
+        logpt = F.log_softmax(input, dim = 1)
+        logpt = logpt.gather(1,target.long())
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        if self.alpha is not None:
+            if self.alpha.type()!=input.data.type():
+                self.alpha = self.alpha.type_as(input.data)
+            at = self.alpha.gather(0, (target.data.view(-1)).long())
+            logpt = logpt * Variable(at)
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        return loss.mean()
     
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.1, beta=0.9, eps = 1e-8):
@@ -355,7 +320,7 @@ class LovaszSoftmax(nn.Module):
             input = input.permute(0, 2, 3, 4, 1).contiguous()
             input_flatten = input.view(-1, num_class)
         
-        input_flatten_proba = torch.sigmoid(input_flatten)
+        input_flatten_proba = torch.softmax(input_flatten, dim=1)
         target_flatten = target.view(-1)
         
         return input_flatten_proba, target_flatten
@@ -546,8 +511,7 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
     elif name == 'FocalLoss':
         alpha = loss_config.get('alpha', 0.75)
         gamma = loss_config.get('gamma', 2.)
-        eps = loss_config.get('eps', 1e-8)
-        return FocalLoss(alpha=alpha, gamma=gamma, eps=eps)
+        return FocalLoss(alpha=alpha, gamma=gamma)
     
     elif name == 'TverskyLoss':
         alpha = loss_config.get('alpha', 0.1)
