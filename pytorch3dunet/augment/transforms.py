@@ -74,7 +74,7 @@ class RandomFlip:
     def __call__(self, img):
         assert img.ndim == 3
         img_tmp = np.moveaxis(img, -1, 0)
-        img_aug = iaa.flip.Fliplr(img_tmp, p = self.proba, seed = self.random_state)
+        img_aug = iaa.flip.fliplr(img_tmp, p = self.proba, seed = self.random_state)
         return np.moveaxis(img_aug, 0, -1)
 
 
@@ -92,8 +92,10 @@ class RandomScale:
     def __call__(self, img):
         assert img.ndim == 3
         img_tmp = np.moveaxis(img, -1, 0)
-        img_aug = iaa.geometric.Affine(img_tmp, scale = self.scale, order = self.order, 
+        aug = iaa.geometric.Affine(scale = self.scale, order = self.order, 
             mode = self.mode, seed = self.random_state)
+        img_aug = aug.augment_image(img_tmp)
+        
         return np.moveaxis(img_aug, 0, -1)
 
 
@@ -111,8 +113,10 @@ class RandomTranslate:
     def __call__(self, img):
         assert img.ndim == 3
         img_tmp = np.moveaxis(img, -1, 0)
-        img_aug = iaa.geometric.Affine(img_tmp, translate_percent = self.percent, order = self.order, 
+        aug = iaa.geometric.Affine(translate_percent = self.percent, order = self.order, 
             mode = self.mode, seed = self.random_state)
+        img_aug = aug.augment_image(img_tmp)
+
         return np.moveaxis(img_aug, 0, -1)
 
 
@@ -130,8 +134,10 @@ class RandomRotate:
     def __call__(self, img):
         assert img.ndim == 3
         img_tmp = np.moveaxis(img, -1, 0)
-        img_aug = iaa.geometric.Affine(img_tmp, rotate = self.rotate, order = self.order, 
+        aug = iaa.geometric.Affine(rotate = self.rotate, order = self.order, 
             mode = self.mode, seed = self.random_state)
+        img_aug = aug.augment_image(img_tmp)
+        
         return np.moveaxis(img_aug, 0, -1)
 
 
