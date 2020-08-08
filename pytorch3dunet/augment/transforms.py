@@ -74,9 +74,11 @@ class RandomFlip:
     def __call__(self, img):
         assert img.ndim == 3
         img_tmp = np.moveaxis(img, -1, 0)
-        img_aug = iaa.flip.fliplr(img_tmp, p = self.proba, seed = self.random_state)
+        aug = iaa.flip.Fliplr(p = self.proba, seed = self.random_state)
+        img_aug = aug.augment_image(img_tmp)
+        
         return np.moveaxis(img_aug, 0, -1)
-
+        
 
 class RandomScale:
     """
