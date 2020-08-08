@@ -16,7 +16,6 @@ from pytorch3dunet.unet3d.utils import get_number_of_learnable_parameters
 
 logger = get_logger('UNet3DTrain')
 
-
 def _create_trainer(config, model, optimizer, lr_scheduler, loss_criterion, eval_criterion, loaders):
     assert 'trainer' in config, 'Could not find trainer configuration'
     trainer_config = config['trainer']

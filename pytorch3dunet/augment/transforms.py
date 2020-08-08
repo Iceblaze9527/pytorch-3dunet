@@ -6,10 +6,58 @@ from scipy.ndimage import rotate, map_coordinates, gaussian_filter
 from scipy.ndimage.filters import convolve
 from skimage.filters import gaussian
 from skimage.segmentation import find_boundaries
+
+import imgaug.augmenters as iaa
 from torchvision.transforms import Compose
 
 # WARN: use fixed random state for reproducibility; if you want to randomize on each run seed with `time.time()` e.g.
 GLOBAL_RANDOM_STATE = np.random.RandomState(47)
+
+
+class Standardize:
+    """
+    Apply Z-score normalization to a given input tensor, i.e. re-scaling the values to be 0-mean and 1-std.
+    Mean and std parameter have to be provided explicitly.
+    """
+
+    def __init__(self, mean, std, eps=1e-6, **kwargs):
+        self.mean = mean
+        self.std = std
+        self.eps = eps
+
+    def __call__(self, m):
+        return (m - self.mean) / np.clip(self.std, a_min=self.eps, a_max=None)
+
+
+class Normalize:
+    """
+    Apply simple min-max scaling to a given input tensor, i.e. shrinks the range of the data in a fixed range of [-1, 1].
+    """
+
+    def __init__(self, min_value, max_value, **kwargs):
+        assert max_value > min_value
+        self.min_value = min_value
+        self.value_range = max_value - min_value
+
+    def __call__(self, m):
+        norm_0_1 = (m - self.min_value) / self.value_range
+        return np.clip(2 * norm_0_1 - 1, -1, 1)
+
+
+class Relabel:
+    """
+    Relabel a numpy array of labels into a consecutive numbers, e.g.
+    [10,10, 0, 6, 6] -> [2, 2, 0, 1, 1]. Useful when one has an instance segmentation volume
+    at hand and would like to create a one-hot-encoding for it. Without a consecutive labeling the task would be harder.
+    """
+
+    def __init__(self, **kwargs):
+        pass
+
+    def __call__(self, m):
+        _, unique_labels = np.unique(m, return_inverse=True)
+        m = unique_labels.reshape(m.shape)
+        return m
 
 
 class RandomFlip:
@@ -19,55 +67,53 @@ class RandomFlip:
     When creating make sure that the provided RandomStates are consistent between raw and labeled datasets,
     otherwise the models won't converge.
     """
-
-    def __init__(self, random_state, axis_prob=0.5, **kwargs):
-        assert random_state is not None, 'RandomState cannot be None'
+    def __init__(self, random_state, proba=0.5, **kwargs):
         self.random_state = random_state
-        self.axes = (0, 1, 2)
-        self.axis_prob = axis_prob
+        self.proba = proba
 
-    def __call__(self, m):
-        assert m.ndim in [3, 4], 'Supports only 3D (DxHxW) or 4D (CxDxHxW) images'
-
-        for axis in self.axes:
-            if self.random_state.uniform() > self.axis_prob:
-                if m.ndim == 3:
-                    m = np.flip(m, axis)
-                else:
-                    channels = [np.flip(m[c], axis) for c in range(m.shape[0])]
-                    m = np.stack(channels, axis=0)
-
-        return m
+    def __call__(self, img):
+        assert img.ndim == 3
+        img_tmp = np.moveaxis(img, -1, 0)
+        img_aug = iaa.flip.Fliplr(img_tmp, p = self.proba, seed = self.random_state)
+        return np.moveaxis(img_aug, 0, -1)
 
 
-class RandomRotate90:
+class RandomScale:
     """
-    Rotate an array by 90 degrees around a randomly chosen plane. Image can be either 3D (DxHxW) or 4D (CxDxHxW).
-
-    When creating make sure that the provided RandomStates are consistent between raw and labeled datasets,
-    otherwise the models won't converge.
-
-    IMPORTANT: assumes DHW axis order (that's why rotation is performed across (1,2) axis)
+    Rotate an array by a random degrees from taken from (-angle_spectrum, angle_spectrum) interval.
+    Rotation axis is picked at random from the list of provided axes.
     """
-
-    def __init__(self, random_state, **kwargs):
+    def __init__(self, random_state, scale=(-0.8,1.2), order=0, mode='reflect', **kwargs):
         self.random_state = random_state
-        # always rotate around z-axis
-        self.axis = (1, 2)
+        self.scale = scale
+        self.order = order
+        self.mode = mode
 
-    def __call__(self, m):
-        assert m.ndim in [3, 4], 'Supports only 3D (DxHxW) or 4D (CxDxHxW) images'
+    def __call__(self, img):
+        assert img.ndim == 3
+        img_tmp = np.moveaxis(img, -1, 0)
+        img_aug = iaa.geometric.Affine(img_tmp, scale = self.scale, order = self.order, 
+            mode = self.mode, seed = self.random_state)
+        return np.moveaxis(img_aug, 0, -1)
 
-        # pick number of rotations at random
-        k = self.random_state.randint(0, 4)
-        # rotate k times around a given plane
-        if m.ndim == 3:
-            m = np.rot90(m, k, self.axis)
-        else:
-            channels = [np.rot90(m[c], k, self.axis) for c in range(m.shape[0])]
-            m = np.stack(channels, axis=0)
 
-        return m
+class RandomTranslate:
+    """
+    Rotate an array by a random degrees from taken from (-angle_spectrum, angle_spectrum) interval.
+    Rotation axis is picked at random from the list of provided axes.
+    """
+    def __init__(self, random_state, percent=(-0.1, 0.1), order=0, mode='reflect', **kwargs):
+        self.random_state = random_state
+        self.percent = percent
+        self.order = order
+        self.mode = mode
+
+    def __call__(self, img):
+        assert img.ndim == 3
+        img_tmp = np.moveaxis(img, -1, 0)
+        img_aug = iaa.geometric.Affine(img_tmp, translate_percent = self.percent, order = self.order, 
+            mode = self.mode, seed = self.random_state)
+        return np.moveaxis(img_aug, 0, -1)
 
 
 class RandomRotate:
@@ -75,52 +121,18 @@ class RandomRotate:
     Rotate an array by a random degrees from taken from (-angle_spectrum, angle_spectrum) interval.
     Rotation axis is picked at random from the list of provided axes.
     """
-
-    def __init__(self, random_state, angle_spectrum=30, axes=None, mode='reflect', order=0, **kwargs):
-        if axes is None:
-            axes = [(1, 0), (2, 1), (2, 0)]
-        else:
-            assert isinstance(axes, list) and len(axes) > 0
-
+    def __init__(self, random_state, rotate=(-15,15), order=0, mode='reflect', **kwargs):
         self.random_state = random_state
-        self.angle_spectrum = angle_spectrum
-        self.axes = axes
-        self.mode = mode
+        self.rotate = rotate
         self.order = order
+        self.mode = mode
 
-    def __call__(self, m):
-        axis = self.axes[self.random_state.randint(len(self.axes))]
-        angle = self.random_state.randint(-self.angle_spectrum, self.angle_spectrum)
-
-        if m.ndim == 3:
-            m = rotate(m, angle, axes=axis, reshape=False, order=self.order, mode=self.mode, cval=-1)
-        else:
-            channels = [rotate(m[c], angle, axes=axis, reshape=False, order=self.order, mode=self.mode, cval=-1) for c
-                        in range(m.shape[0])]
-            m = np.stack(channels, axis=0)
-
-        return m
-
-
-class RandomContrast:
-    """
-    Adjust contrast by scaling each voxel to `mean + alpha * (v - mean)`.
-    """
-
-    def __init__(self, random_state, alpha=(0.5, 1.5), mean=0.0, execution_probability=0.1, **kwargs):
-        self.random_state = random_state
-        assert len(alpha) == 2
-        self.alpha = alpha
-        self.mean = mean
-        self.execution_probability = execution_probability
-
-    def __call__(self, m):
-        if self.random_state.uniform() < self.execution_probability:
-            alpha = self.random_state.uniform(self.alpha[0], self.alpha[1])
-            result = self.mean + alpha * (m - self.mean)
-            return np.clip(result, -1, 1)
-
-        return m
+    def __call__(self, img):
+        assert img.ndim == 3
+        img_tmp = np.moveaxis(img, -1, 0)
+        img_aug = iaa.geometric.Affine(img_tmp, rotate = self.rotate, order = self.order, 
+            mode = self.mode, seed = self.random_state)
+        return np.moveaxis(img_aug, 0, -1)
 
 
 # it's relatively slow, i.e. ~1s per patch of size 64x200x200, so use multiple workers in the DataLoader
@@ -187,7 +199,6 @@ def blur_boundary(boundary, sigma):
     boundary[boundary < 0.5] = 0
     return boundary
 
-
 class CropToFixed:
     def __init__(self, random_state, size=(256, 256), centered=False, **kwargs):
         self.random_state = random_state
@@ -232,6 +243,12 @@ class CropToFixed:
         result = m[:, y_start:y_start + self.crop_y, x_start:x_start + self.crop_x]
         return np.pad(result, pad_width=((0, 0), y_pad, x_pad), mode='reflect')
 
+def _recover_ignore_index(input, orig, ignore_index):
+    if ignore_index is not None:
+        mask = orig == ignore_index
+        input[mask] = ignore_index
+
+    return input
 
 class AbstractLabelToBoundary:
     AXES_TRANSPOSE = [
@@ -546,36 +563,6 @@ class LabelToMaskAndAffinities:
         return np.concatenate((mask, affinities), axis=0)
 
 
-class Standardize:
-    """
-    Apply Z-score normalization to a given input tensor, i.e. re-scaling the values to be 0-mean and 1-std.
-    Mean and std parameter have to be provided explicitly.
-    """
-
-    def __init__(self, mean, std, eps=1e-6, **kwargs):
-        self.mean = mean
-        self.std = std
-        self.eps = eps
-
-    def __call__(self, m):
-        return (m - self.mean) / np.clip(self.std, a_min=self.eps, a_max=None)
-
-
-class Normalize:
-    """
-    Apply simple min-max scaling to a given input tensor, i.e. shrinks the range of the data in a fixed range of [-1, 1].
-    """
-
-    def __init__(self, min_value, max_value, **kwargs):
-        assert max_value > min_value
-        self.min_value = min_value
-        self.value_range = max_value - min_value
-
-    def __call__(self, m):
-        norm_0_1 = (m - self.min_value) / self.value_range
-        return np.clip(2 * norm_0_1 - 1, -1, 1)
-
-
 class AdditiveGaussianNoise:
     def __init__(self, random_state, scale=(0.0, 1.0), execution_probability=0.1, **kwargs):
         self.execution_probability = execution_probability
@@ -603,42 +590,6 @@ class AdditivePoissonNoise:
             return m + poisson_noise
         return m
 
-
-class ToTensor:
-    """
-    Converts a given input numpy.ndarray into torch.Tensor. Adds additional 'channel' axis when the input is 3D
-    and expand_dims=True (use for raw data of the shape (D, H, W)).
-    """
-
-    def __init__(self, expand_dims, dtype=np.float32, **kwargs):
-        self.expand_dims = expand_dims
-        self.dtype = dtype
-
-    def __call__(self, m):
-        assert m.ndim in [3, 4], 'Supports only 3D (DxHxW) or 4D (CxDxHxW) images'
-        # add channel dimension
-        if self.expand_dims and m.ndim == 3:
-            m = np.expand_dims(m, axis=0)
-
-        return torch.from_numpy(m.astype(dtype=self.dtype))
-
-
-class Relabel:
-    """
-    Relabel a numpy array of labels into a consecutive numbers, e.g.
-    [10,10, 0, 6, 6] -> [2, 2, 0, 1, 1]. Useful when one has an instance segmentation volume
-    at hand and would like to create a one-hot-encoding for it. Without a consecutive labeling the task would be harder.
-    """
-
-    def __init__(self, **kwargs):
-        pass
-
-    def __call__(self, m):
-        _, unique_labels = np.unique(m, return_inverse=True)
-        m = unique_labels.reshape(m.shape)
-        return m
-
-
 class Identity:
     def __init__(self, **kwargs):
         pass
@@ -646,6 +597,27 @@ class Identity:
     def __call__(self, m):
         return m
 
+class ToTensor:
+    """
+    Converts a given input numpy.ndarray into torch.Tensor. Adds additional 'channel' axis when the input is 3D
+    and expand_dims=True (use for raw data of the shape (D, H, W)).
+    """
+
+    def __init__(self, expand_dims, **kwargs):
+        self.expand_dims = expand_dims
+
+    def __call__(self, img):
+        assert img.ndim in [3, 4], 'Supports only 3D (DxHxW) or 4D (CxDxHxW) images'
+        # add channel dimension
+        if self.expand_dims and img.ndim == 3:
+            img_exp = np.expand_dims(img, axis=0)
+
+        if np.issubdtype(img_exp.dtype, np.floating):
+            return torch.from_numpy(img_exp)
+        elif np.issubdtype(img_exp.dtype, np.integer):
+            return torch.from_numpy(img_exp.astype(np.int64))
+        else:
+            raise ValueError(f"Unsupported Data Type, Got '{img_exp.dtype}'.")
 
 def get_transformer(config, min_value, max_value, mean, std):
     base_config = {'min_value': min_value, 'max_value': max_value, 'mean': mean, 'std': std}
@@ -655,7 +627,7 @@ def get_transformer(config, min_value, max_value, mean, std):
 class Transformer:
     def __init__(self, phase_config, base_config):
         self.phase_config = phase_config
-        self.config_base = base_config
+        self.base_config = base_config
         self.seed = GLOBAL_RANDOM_STATE.randint(10000000)
 
     def raw_transform(self):
@@ -680,16 +652,8 @@ class Transformer:
         ])
 
     def _create_augmentation(self, c):
-        config = dict(self.config_base)
+        config = dict(self.base_config)
         config.update(c)
         config['random_state'] = np.random.RandomState(self.seed)
         aug_class = self._transformer_class(config['name'])
         return aug_class(**config)
-
-
-def _recover_ignore_index(input, orig, ignore_index):
-    if ignore_index is not None:
-        mask = orig == ignore_index
-        input[mask] = ignore_index
-
-    return input

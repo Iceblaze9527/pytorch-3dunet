@@ -1,6 +1,6 @@
 package:
-  name: pytorch-3dunet-local-2
-  version: {{ GIT_DESCRIBE_TAG }}
+  name: pytorch-3dunet-local
+  version: 1.2.2
 
 source:
   path: ..
@@ -17,7 +17,6 @@ requirements:
 
   run:
     - python 3.7
-    # TODO: change after new torchvision release
     - pillow<7
     - torchvision
     - tensorboardx
@@ -41,5 +40,5 @@ test:
     - py.test
 
 about:
-  home: https://github.com/wolny/pytorch-3dunet
+  home: https://github.com/Iceblaze9527/pytorch-3dunet
   license: MIT
