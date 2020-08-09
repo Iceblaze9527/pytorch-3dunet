@@ -88,13 +88,12 @@ class UNet3DTrainer:
         self.skip_train_validation = skip_train_validation
 
     @classmethod
-    def from_checkpoint(cls, checkpoint_path, model, optimizer, lr_scheduler, loss_criterion, eval_criterion, loaders,
-                        tensorboard_formatter=None, skip_train_validation=False):
+    def from_checkpoint(cls, checkpoint_path, checkpoint_dir, model, optimizer, lr_scheduler, loss_criterion, eval_criterion, loaders, tensorboard_formatter=None, skip_train_validation=False):
+        
         logger.info(f"Loading checkpoint '{checkpoint_path}'...")
         state = utils.load_checkpoint(checkpoint_path, model, optimizer)
-        logger.info(
-            f"Checkpoint loaded. Epoch: {state['epoch']}. Best val score: {state['best_eval_score']}. Num_iterations: {state['num_iterations']}")
-        checkpoint_dir = os.path.split(checkpoint_path)[0]
+        logger.info(f"Checkpoint loaded. Epoch: {state['epoch']}. Best val score: {state['best_eval_score']}. Num_iterations: {state['num_iterations']}")
+
         return cls(model, optimizer, lr_scheduler,
                    loss_criterion, eval_criterion,
                    torch.device(state['device']),
@@ -110,18 +109,13 @@ class UNet3DTrainer:
                    validate_iters=state['validate_iters'],
                    tensorboard_formatter=tensorboard_formatter,
                    skip_train_validation=skip_train_validation)
-
+    
     @classmethod
-    def from_pretrained(cls, pre_trained, model, optimizer, lr_scheduler, loss_criterion, eval_criterion,
-                        device, loaders,
-                        max_num_epochs=100, max_num_iterations=1e5,
-                        validate_after_iters=100, log_after_iters=100,
-                        validate_iters=None, num_iterations=1, num_epoch=0,
-                        eval_score_higher_is_better=True, best_eval_score=None,
-                        tensorboard_formatter=None, skip_train_validation=False):
+    def from_pretrained(cls, pre_trained, checkpoint_dir, model, optimizer, lr_scheduler, loss_criterion, eval_criterion, device, loaders, max_num_epochs=100, max_num_iterations=1e5, validate_after_iters=100, log_after_iters=100, validate_iters=None, num_iterations=1, num_epoch=0, eval_score_higher_is_better=True, best_eval_score=None, tensorboard_formatter=None, skip_train_validation=False):
+        
         logger.info(f"Logging pre-trained model from '{pre_trained}'...")
         utils.load_checkpoint(pre_trained, model, None)
-        checkpoint_dir = os.path.split(pre_trained)[0]
+
         return cls(model, optimizer, lr_scheduler,
                    loss_criterion, eval_criterion,
                    device, loaders, checkpoint_dir,
